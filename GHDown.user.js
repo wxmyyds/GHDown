@@ -130,7 +130,7 @@
         // 先排除导航链接
         if (isNavigationLink(href)) return false;
 
-        // 已经是代理链接？跳过
+        // 已经是镜像链接？跳过
         if (PROXY_LIST.some(p => href.startsWith(p.url))) return false;
 
         // 检查是否匹配下载模式
@@ -273,7 +273,7 @@
     /* ==================== 初始化 ==================== */
 
     function init() {
-        console.log('[GitHub加速] 启动，当前代理:', PROXY_LIST[currentProxyIndex].name);
+        console.log('[GitHub加速] 启动，当前镜像:', PROXY_LIST[currentProxyIndex].name);
 
         // 首次扫描
         setTimeout(scanDownloadLinks, 500);
@@ -302,6 +302,5 @@
     } else {
         init();
     }
-
 
 })();
