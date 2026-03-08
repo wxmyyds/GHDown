@@ -21,7 +21,7 @@
 
     /* ==================== 配置区 ==================== */
     const PROXY_LIST = [
-        { url: "https://ghproxy.net/", name: "🚀 主代理", color: "#2cbe4e" },
+        { url: "https://ghproxy.net/", name: "🚀 主镜像", color: "#2cbe4e" },
         { url: "https://ghp.ci/", name: "⚡ 备用1", color: "#e67e22" },
         { url: "https://moeyy.cn/gh-proxy/", name: "🛡️ 备用2", color: "#3498db" }
     ];
@@ -302,5 +302,6 @@
     } else {
         init();
     }
+
 
 })();
