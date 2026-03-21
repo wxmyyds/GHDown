@@ -1,15 +1,13 @@
 // ==UserScript==
 // @name         GitHub 高速下载
 // @namespace    https://github.com/wxmyyds
-// @version      4.2.0
-// @description  GitHub 下载加速：Release文件、源码包、Raw文件一键提速，完美兼容IDM
+// @version      4.3.0
+// @description  GitHub 下载加速：Release文件、源码包、Raw文件一键提速
 // @author       wxmyyds
 // @match        https://github.com/*
 // @match        https://gist.github.com/*
 // @icon         https://github.githubassets.com/favicons/favicon.svg
 // @license      MIT
-// @supportURL   https://github.com/wxmyyds/GHDown/issues
-// @homepageURL  https://github.com/wxmyyds/GHDown
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
@@ -19,288 +17,174 @@
 (function() {
     'use strict';
 
-    /* ==================== 配置区 ==================== */
+    /* ==================== 配置与规则 ==================== */
     const PROXY_LIST = [
-        { url: "https://ghproxy.net/", name: "🚀 主镜像", color: "#2cbe4e" },
-        { url: "https://ghp.ci/", name: "⚡ 备用1", color: "#e67e22" },
-        { url: "https://moeyy.cn/gh-proxy/", name: "🛡️ 备用2", color: "#3498db" }
+        { url: "https://ghproxy.net/", name: "🚀 主镜像" },
+        { url: "https://ghp.ci/", name: "⚡ 备用1" },
+        { url: "https://moeyy.cn/gh-proxy/", name: "🛡️ 备用2" }
     ];
+
+    const WHITE_LIST = ['github.com', 'raw.githubusercontent.com', 'gist.github.com', 'codeload.github.com'];
+
+    const DOWNLOAD_PATTERNS = [
+        '/releases/download/', 'github-production-release-asset', 'release-assets.githubusercontent.com',
+        '/archive/', '/zipball/', '/tarball/', '/raw/', 'raw.githubusercontent.com'
+    ];
+
+    const EXT_PATTERNS = ['.zip', '.7z', '.rar', '.tar.gz', '.tgz', '.exe', '.msi', '.deb', '.dmg', '.apk', '.bin'];
 
     let currentProxyIndex = parseInt(GM_getValue('proxyIndex', '0'));
-    let currentProxy = PROXY_LIST[currentProxyIndex].url;
-
-    /* ==================== 精准匹配规则 ==================== */
-
-    // ✅ 只有这些模式的链接才被认为是"下载链接"
-    const DOWNLOAD_PATTERNS = [
-        // Release 文件
-        '/releases/download/',
-        'github-production-release-asset',
-        'release-assets.githubusercontent.com',
-
-        // 源码压缩包
-        '/archive/',
-        '/zipball/',
-        '/tarball/',
-        'codeload.github.com',
-
-        // Raw 文件
-        '/raw/',
-        'raw.githubusercontent.com',
-
-        // 文件后缀特征（只匹配以这些结尾的链接）
-        '.zip', '.7z', '.rar', '.tar.gz', '.tgz', '.bz2', '.xz',
-        '.exe', '.msi', '.deb', '.rpm', '.apk', '.dmg',
-        '.jar', '.war', '.nupkg',
-        '.pdf', '.epub',
-        '.iso', '.img',
-        '.sh', '.bin', '.run'
-    ];
-
-    // ❌ 绝对排除的导航链接（无论如何都不处理）
-    const NAVIGATION_PATTERNS = [
-        // 仓库导航
-        '/issues',
-        '/pull/',
-        '/pulls',
-        '/actions',
-        '/projects',
-        '/wiki',
-        '/security',
-        '/pulse',
-        '/forks',
-        '/stars',
-        '/watchers',
-
-        // 页面内跳转
-        '#',
-        '/#',
-
-        // 用户/组织相关
-        '/settings',
-        '/notifications',
-        '/sponsors',
-
-        // 特定页面元素
-        '/tree/',      // 目录导航
-        '/blob/',      // 文件查看（不是下载）
-        '/commits/',
-        '/branches/',
-        '/tags/',
-        '/releases/tag/',  // Release 标签页（不是下载）
-        '/releases/latest',
-        '/expanded_assets',  // "Show all assets" 按钮
-
-        // 社交功能
-        '/stargazers',
-        '/network',
-        '/fork'
-    ];
+    let initialized = false;
+    let mainObserver = null;
 
     /* ==================== 工具函数 ==================== */
 
-    function isNavigationLink(href) {
-        if (!href) return true;
+    function isDownloadLink(link) {
+        try {
+            const href = link.getAttribute('href');
+            if (!href || href.startsWith('#') || href.startsWith('javascript:')) return false;
 
-        // 检查是否匹配排除模式
-        if (NAVIGATION_PATTERNS.some(p => href.includes(p))) {
-            return true;
-        }
+            // 1. 白名单检查：确保是 GitHub 相关域名
+            const urlObj = new URL(href, window.location.origin);
+            if (!WHITE_LIST.some(domain => urlObj.hostname.includes(domain))) return false;
 
-        // 检查是否是相对路径的目录导航
-        if (href.startsWith('/') && !href.includes('/releases/') && !href.includes('/archive/')) {
-            const parts = href.split('/');
-            // 如果是 /username/repo 格式，且长度合适，可能是仓库根目录
-            if (parts.length === 3 && parts[1] && parts[2]) {
-                return true;
+            // 2. 已经是代理链接则跳过
+            if (PROXY_LIST.some(p => href.startsWith(p.url))) return false;
+
+            // 3. 排除非下载链接（精细化：允许 releases/tag/ 内的特定下载路径）
+            if (href.includes('/releases/tag/') && !href.includes('/download/')) {
+                // 如果是以压缩包后缀结尾的 tag 链接（如 .zip），则允许
+                if (!EXT_PATTERNS.some(ext => href.toLowerCase().endsWith(ext))) return false;
             }
-        }
 
-        // 检查是否是 GitHub 内部功能链接
-        if (href.includes('/commit/') || href.includes('/tree/')) {
-            return true;
-        }
+            // 4. 排除导航与查看逻辑
+            if (href.includes('/blob/') && !href.includes('raw=true')) return false;
+            if (link.closest('nav, .AppHeader, .tabnav, .ActionList')) return false;
 
-        return false;
+            // 5. 命中模式
+            return DOWNLOAD_PATTERNS.some(p => href.includes(p)) ||
+                   EXT_PATTERNS.some(ext => href.toLowerCase().endsWith(ext));
+        } catch (e) { return false; }
     }
 
-    function isDownloadLink(href) {
-        if (!href || typeof href !== 'string') return false;
-
-        // 先排除导航链接
-        if (isNavigationLink(href)) return false;
-
-        // 已经是镜像链接？跳过
-        if (PROXY_LIST.some(p => href.startsWith(p.url))) return false;
-
-        // 检查是否匹配下载模式
-        const isDownload = DOWNLOAD_PATTERNS.some(pattern =>
-            href.includes(pattern) || href.endsWith(pattern)
-        );
-
-        // 额外的安全检查：确保是文件下载而不是页面
-        if (isDownload) {
-            // 如果链接指向 GitHub 页面（不是文件），排除
-            if (href.includes('/blob/') && !href.includes('raw=true')) {
-                return false; // /blob/ 是文件查看页面，不是直接下载
-            }
-
-            // 如果链接以 /releases/tag/ 结尾，排除
-            if (href.includes('/releases/tag/')) {
-                return false;
-            }
-        }
-
-        return isDownload;
-    }
-
-    /* ==================== 核心处理函数 ==================== */
+    /* ==================== 核心处理 ==================== */
 
     function processLink(link) {
-        // 跳过已处理的
-        if (link.getAttribute('data-accel-ready')) return false;
-
-        const href = link.getAttribute('href');
-
-        // 严格判断：只有确认是下载链接才处理
-        if (!isDownloadLink(href)) return false;
-
-        // 二次确认：检查元素上下文
-        // 如果链接在导航栏、菜单中，可能是误判
-        const parentClasses = link.closest('nav, .menu, .dropdown, .header') ? 'nav' : '';
-        if (parentClasses) {
-            console.debug('跳过导航链接:', href);
-            return false;
-        }
-
         try {
-            // 构建完整URL
-            let fullUrl = href;
-            if (fullUrl.startsWith('//')) {
-                fullUrl = 'https:' + fullUrl;
-            } else if (fullUrl.startsWith('/')) {
-                fullUrl = 'https://github.com' + fullUrl;
+            if (!isDownloadLink(link)) return;
+
+            // 存储原始 URL（原子化操作）
+            if (!link.hasAttribute('data-original-href')) {
+                const rawHref = link.getAttribute('href');
+                let fullUrl = rawHref;
+                if (fullUrl.startsWith('//')) fullUrl = 'https:' + fullUrl;
+                else if (fullUrl.startsWith('/')) fullUrl = window.location.origin + fullUrl;
+                link.setAttribute('data-original-href', fullUrl);
             }
 
-            const acceleratedUrl = currentProxy + fullUrl;
+            const original = link.getAttribute('data-original-href');
+            const proxy = PROXY_LIST[currentProxyIndex].url;
 
-            // 只替换 href，保持其他属性不变
-            link.href = acceleratedUrl;
+            // 避免重复拼接
+            link.href = original.startsWith(proxy) ? original : proxy + original;
 
-            // 添加 download 属性（帮助 IDM 识别）
-            if (!link.hasAttribute('download')) {
-                link.setAttribute('download', '');
-            }
+            // 设置下载属性
+            if (!link.hasAttribute('download')) link.setAttribute('download', '');
 
-            // 标记已处理
             link.setAttribute('data-accel-ready', 'true');
 
-            // 添加极简视觉提示（可选）
-            if (!link.querySelector('.accel-mini') && !link.closest('.btn')) {
+            // 视觉提示
+            if (!link.querySelector('.accel-mini')) {
                 const mini = document.createElement('span');
                 mini.className = 'accel-mini';
                 mini.textContent = '⚡';
-                mini.style.marginLeft = '2px';
-                mini.style.fontSize = '10px';
-                mini.style.opacity = '0.4';
-                mini.title = '已加速';
+                mini.style.cssText = 'margin-left:2px; font-size:10px; opacity:0.4; pointer-events:none;';
                 link.appendChild(mini);
             }
-
-            return true;
         } catch (e) {
-            console.debug('处理失败:', e);
-            return false;
+            link.setAttribute('data-accel-ready', 'error');
+            console.debug('[GHDown] Error processing link:', e);
         }
     }
-
-    /* ==================== 智能扫描（只处理确定的部分） ==================== */
 
     function scanDownloadLinks() {
-        // 只在 Release 页面和文件列表页面深度扫描
-        const isReleasesPage = window.location.pathname.includes('/releases');
-        const isRepoRoot = window.location.pathname.split('/').length === 3;
+        // 限制单次扫描规模，防止超大页面卡顿
+        const links = Array.from(document.querySelectorAll('a[href]:not([data-accel-ready])')).slice(0, 500);
+        if (links.length === 0) return;
 
-        let processed = 0;
-
-        if (isReleasesPage) {
-            // Release 页面：扫描所有可能的下载链接
-            const releaseLinks = document.querySelectorAll('a[href*="/releases/download/"], a[href*="release-assets"]');
-            releaseLinks.forEach(link => {
-                if (processLink(link)) processed++;
+        if (window.requestIdleCallback) {
+            requestIdleCallback((deadline) => {
+                let i = 0;
+                while (i < links.length && (deadline.timeRemaining() > 0 || deadline.didTimeout)) {
+                    processLink(links[i++]);
+                }
             });
-        }
-
-        // 总是扫描明确的下载链接
-        const downloadLinks = document.querySelectorAll('a[href*="/archive/"], a[href*="codeload"], a[href$=".zip"], a[href$=".exe"], a[href$=".msi"]');
-        downloadLinks.forEach(link => {
-            if (processLink(link)) processed++;
-        });
-
-        if (processed > 0) {
-            console.log(`[加速] 已处理 ${processed} 个下载链接`);
+        } else {
+            setTimeout(() => links.forEach(processLink), 10);
         }
     }
 
-    /* ==================== 监听器 ==================== */
+    /* ==================== 监听增强 ==================== */
 
     function setupObservers() {
-        // 只监听特定区域的变化，避免全局监听
-        const targetNodes = [
-            document.querySelector('.release-main-section'),
-            document.querySelector('.repository-content'),
-            document.querySelector('.js-release-list')
-        ].filter(Boolean);
-
-        if (targetNodes.length === 0) return;
-
-        const observer = new MutationObserver(() => {
-            // 使用防抖
-            clearTimeout(window.scanTimer);
-            window.scanTimer = setTimeout(() => {
-                scanDownloadLinks();
-            }, 300);
-        });
-
-        targetNodes.forEach(node => {
-            observer.observe(node, {
-                childList: true,
-                subtree: true
+        const startObserve = () => {
+            if (mainObserver) mainObserver.disconnect();
+            mainObserver = new MutationObserver(() => {
+                clearTimeout(window.scanTimer);
+                window.scanTimer = setTimeout(scanDownloadLinks, 500);
             });
+            if (document.body) {
+                mainObserver.observe(document.body, { childList: true, subtree: true });
+            }
+        };
+
+        // 监听 Body 替换（应对某些极端的 SPA 框架行为）
+        const rootObserver = new MutationObserver(() => {
+            if (document.body && (!mainObserver || !document.body.contains(mainObserver.target))) {
+                startObserve();
+                scanDownloadLinks();
+            }
+        });
+        rootObserver.observe(document.documentElement, { childList: true });
+
+        startObserve();
+
+        // 兼容所有 GitHub 导航事件
+        ['turbo:load', 'turbo:render', 'pjax:success', 'pjax:end'].forEach(event => {
+            document.addEventListener(event, () => setTimeout(scanDownloadLinks, 200));
         });
     }
 
-    /* ==================== 初始化 ==================== */
+    /* ==================== 初始化与菜单 ==================== */
 
     function init() {
-        console.log('[GitHub加速] 启动，当前镜像:', PROXY_LIST[currentProxyIndex].name);
+        if (initialized) return;
+        initialized = true;
 
-        // 首次扫描
-        setTimeout(scanDownloadLinks, 500);
-
-        // 设置监听
-        document.addEventListener('turbo:render', () => {
-            setTimeout(scanDownloadLinks, 300);
-        });
-
+        scanDownloadLinks();
         setupObservers();
 
-        // 注册菜单命令
         PROXY_LIST.forEach((proxy, index) => {
-            GM_registerMenuCommand(`切换到 ${proxy.name}`, () => {
+            GM_registerMenuCommand(`切换到: ${proxy.name}`, () => {
                 currentProxyIndex = index;
-                currentProxy = proxy.url;
                 GM_setValue('proxyIndex', index);
+
+                // 深度清理逻辑
+                document.querySelectorAll('[data-accel-ready]').forEach(el => {
+                    el.removeAttribute('data-accel-ready');
+                    if (el.hasAttribute('data-original-href')) {
+                        el.href = el.getAttribute('data-original-href');
+                    }
+                    const mini = el.querySelector('.accel-mini');
+                    if (mini) mini.remove();
+                });
+
                 scanDownloadLinks();
+                console.log(`[GHDown] Switched to: ${proxy.name}`);
             });
         });
     }
 
-    // 启动
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
-
+    if (document.readyState !== 'loading') init();
+    else document.addEventListener('DOMContentLoaded', init);
 })();
